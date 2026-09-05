@@ -11,9 +11,17 @@ use symphonia::core::probe::Hint;
 /// Number of frames aggregated into one waveform peak bin.
 pub const PEAK_BIN: usize = 512;
 
-/// A decoded multitrack recording, held entirely in memory.
+/// A decoded multitrack recording, held entirely in memory. It comes either
+/// from one interleaved multichannel file or from several mono/stereo files
+/// laid out as consecutive tracks.
 pub struct AudioData {
+    /// The (first) source file; its directory is where exports and the
+    /// project sidecar default to.
     pub path: PathBuf,
+    /// Every source file, in track order.
+    pub sources: Vec<PathBuf>,
+    /// Channel count of each source file, in the same order as `sources`.
+    pub source_channels: Vec<usize>,
     /// Planar samples, `tracks[channel][frame]`, normalized to [-1.0, 1.0].
     /// Planar storage makes per-track work (mixing, exporting a subset of
     /// tracks) a plain slice walk.
@@ -48,18 +56,50 @@ impl AudioData {
         self.frames() as f64 / self.sample_rate as f64
     }
 
-    pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+    pub fn is_multi_file(&self) -> bool {
+        self.sources.len() > 1
     }
 
-    pub fn file_stem(&self) -> String {
-        self.path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "tape".to_string())
+    /// Display name: the file name, or "N files in <dir>" for a set.
+    pub fn file_name(&self) -> String {
+        if self.is_multi_file() {
+            let dir = self
+                .path
+                .parent()
+                .and_then(|d| d.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("{} files in {dir}", self.sources.len())
+        } else {
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Track names to start from: "Track n" for one multichannel file, the
+    /// file stems for a set of files (with L/R for stereo ones).
+    pub fn default_track_names(&self) -> Vec<String> {
+        if !self.is_multi_file() {
+            return (1..=self.channels()).map(|n| format!("Track {n}")).collect();
+        }
+        let mut names = Vec::with_capacity(self.channels());
+        for (path, &n) in self.sources.iter().zip(&self.source_channels) {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match n {
+                1 => names.push(stem),
+                2 => {
+                    names.push(format!("{stem} L"));
+                    names.push(format!("{stem} R"));
+                }
+                _ => names.extend((1..=n).map(|i| format!("{stem} {i}"))),
+            }
+        }
+        names
     }
 
     pub fn frame_of_secs(&self, secs: f64) -> usize {
@@ -67,7 +107,110 @@ impl AudioData {
     }
 }
 
+/// Convenience for a single file (used by the tests).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load(path: &Path) -> Result<AudioData, String> {
+    load_many(&[path.to_path_buf()])
+}
+
+/// Loads one interleaved multichannel file, or several mono/stereo files
+/// that become consecutive tracks. The files are assumed to start at the
+/// same instant; shorter ones are padded with silence to the longest. Files
+/// are ordered by name (numbers compared numerically, so "track 2" sorts
+/// before "track 10"), whatever order they were picked in.
+pub fn load_many(paths: &[PathBuf]) -> Result<AudioData, String> {
+    if paths.is_empty() {
+        return Err("No file given".to_string());
+    }
+    let mut paths = paths.to_vec();
+    if paths.len() > 1 {
+        paths.sort_by_cached_key(|p| natural_key(&p.file_name().unwrap_or_default().to_string_lossy()));
+    }
+
+    let mut tracks: Vec<Vec<f32>> = Vec::new();
+    let mut source_channels = Vec::with_capacity(paths.len());
+    let mut sample_rate = 0u32;
+    let mut bits_per_sample = 0u32;
+    for path in &paths {
+        let decoded = decode_file(path).map_err(|e| {
+            if paths.len() > 1 {
+                format!("{}: {e}", path.display())
+            } else {
+                e
+            }
+        })?;
+        if sample_rate == 0 {
+            sample_rate = decoded.sample_rate;
+        } else if decoded.sample_rate != sample_rate {
+            return Err(format!(
+                "{} is {} Hz but the first file is {sample_rate} Hz; all files must share a sample rate",
+                path.display(),
+                decoded.sample_rate
+            ));
+        }
+        bits_per_sample = bits_per_sample.max(decoded.bits_per_sample);
+        source_channels.push(decoded.tracks.len());
+        tracks.extend(decoded.tracks);
+    }
+
+    // Pad to the longest file so every track has the same frame count.
+    let frames = tracks.iter().map(|t| t.len()).max().unwrap_or(0);
+    for t in &mut tracks {
+        t.resize(frames, 0.0);
+        t.shrink_to_fit();
+    }
+
+    let peaks = tracks.iter().map(|t| compute_peaks(t)).collect();
+
+    Ok(AudioData {
+        path: paths[0].clone(),
+        sources: paths,
+        source_channels,
+        tracks,
+        sample_rate,
+        bits_per_sample,
+        peaks,
+    })
+}
+
+/// Sort key that compares digit runs numerically.
+fn natural_key(name: &str) -> Vec<(u64, String)> {
+    let lower = name.to_lowercase();
+    let mut key = Vec::new();
+    let mut chars = lower.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut n = 0u64;
+            while let Some(&d) = chars.peek() {
+                if !d.is_ascii_digit() {
+                    break;
+                }
+                n = n.saturating_mul(10).saturating_add(d as u64 - '0' as u64);
+                chars.next();
+            }
+            key.push((n, String::new()));
+        } else {
+            let mut text = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    break;
+                }
+                text.push(d);
+                chars.next();
+            }
+            key.push((u64::MAX, text));
+        }
+    }
+    key
+}
+
+struct Decoded {
+    tracks: Vec<Vec<f32>>,
+    sample_rate: u32,
+    bits_per_sample: u32,
+}
+
+fn decode_file(path: &Path) -> Result<Decoded, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -152,18 +295,11 @@ pub fn load(path: &Path) -> Result<AudioData, String> {
     if tracks.first().is_none_or(|t| t.is_empty()) {
         return Err("File contains no audio".to_string());
     }
-    for t in &mut tracks {
-        t.shrink_to_fit();
-    }
 
-    let peaks = tracks.iter().map(|t| compute_peaks(t)).collect();
-
-    Ok(AudioData {
-        path: path.to_path_buf(),
+    Ok(Decoded {
         tracks,
         sample_rate,
         bits_per_sample,
-        peaks,
     })
 }
 

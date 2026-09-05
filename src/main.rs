@@ -27,18 +27,19 @@ use project::{Project, Song};
 use waveform::{MIN_FPP, ViewParams, WaveformProgram};
 
 fn main() -> iced::Result {
-    // An optional recording or project file on the command line is opened
-    // at startup, as if picked in the Open dialog.
-    let initial = std::env::args_os().nth(1).map(PathBuf::from);
+    // Recording file(s) or a project file on the command line are opened at
+    // startup, as if picked in the Open dialog.
+    let initial: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     iced::application("Multi Track Split — tape song organizer", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| Theme::Dark)
         .window_size((1560.0, 960.0))
         .antialiasing(true)
         .run_with(move || {
-            let task = match initial {
-                Some(path) => Task::done(Message::FileChosen(Some(path))),
-                None => Task::none(),
+            let task = if initial.is_empty() {
+                Task::none()
+            } else {
+                Task::done(Message::FileChosen(Some(initial)))
             };
             (App::default(), task)
         })
@@ -57,7 +58,8 @@ pub enum TimeField {
 #[derive(Debug, Clone)]
 pub enum Message {
     OpenFile,
-    FileChosen(Option<PathBuf>),
+    /// One interleaved recording, several mono/stereo files, or one project.
+    FileChosen(Option<Vec<PathBuf>>),
     Loaded(Result<Arc<AudioData>, String>),
     SaveProject,
     SaveProjectAs,
@@ -189,7 +191,7 @@ impl Default for App {
                 d
             },
             selected_device: DEFAULT_DEVICE.to_string(),
-            status: "Open a multitrack WAV or FLAC file (or a saved project) to get started."
+            status: "Open a multitrack WAV/FLAC, several mono/stereo files, or a saved project to get started."
                 .to_string(),
         }
     }
@@ -445,7 +447,12 @@ impl App {
     fn build_project(&self, project_path: &Path) -> Option<Project> {
         let audio = self.audio.as_ref()?;
         Some(Project {
-            audio_file: project::audio_reference(project_path, &audio.path),
+            audio_files: audio
+                .sources
+                .iter()
+                .map(|p| project::audio_reference(project_path, p))
+                .collect(),
+            audio_file: String::new(),
             sample_rate: audio.sample_rate,
             channels: audio.channels(),
             track_names: self.track_names.clone(),
@@ -532,34 +539,50 @@ impl App {
                 return Task::perform(
                     async {
                         rfd::AsyncFileDialog::new()
-                            .add_filter("Recording or project (WAV/FLAC/JSON)", &["wav", "flac", "json"])
+                            .add_filter("Recording(s) or project (WAV/FLAC/JSON)", &["wav", "flac", "json"])
                             .add_filter("Project", &["json"])
-                            .pick_file()
+                            .pick_files()
                             .await
-                            .map(|h| h.path().to_path_buf())
+                            .map(|hs| hs.iter().map(|h| h.path().to_path_buf()).collect())
                     },
                     Message::FileChosen,
                 );
             }
-            Message::FileChosen(Some(path)) => {
-                let is_project = path
-                    .extension()
-                    .map(|e| e.eq_ignore_ascii_case("json"))
-                    .unwrap_or(false);
-                let audio_path = if is_project {
-                    match project::load(&path) {
+            Message::FileChosen(Some(paths)) if paths.is_empty() => {}
+            Message::FileChosen(Some(paths)) => {
+                let is_json = |p: &Path| {
+                    p.extension()
+                        .map(|e| e.eq_ignore_ascii_case("json"))
+                        .unwrap_or(false)
+                };
+                let audio_paths = if paths.iter().any(|p| is_json(p)) {
+                    let [path] = paths.as_slice() else {
+                        self.status =
+                            "Open either one project file or the recording's audio files, not both."
+                                .to_string();
+                        return Task::none();
+                    };
+                    match project::load(path) {
                         Ok(p) => {
-                            let Some(audio_path) = project::resolve_audio_path(&path, &p.audio_file)
-                            else {
-                                self.status = format!(
-                                    "Recording \"{}\" referenced by the project was not found next to it.",
-                                    p.audio_file
-                                );
+                            let mut resolved = Vec::new();
+                            for file in p.files() {
+                                match project::resolve_audio_path(path, &file) {
+                                    Some(a) => resolved.push(a),
+                                    None => {
+                                        self.status = format!(
+                                            "Recording \"{file}\" referenced by the project was not found next to it."
+                                        );
+                                        return Task::none();
+                                    }
+                                }
+                            }
+                            if resolved.is_empty() {
+                                self.status = "The project references no audio files.".to_string();
                                 return Task::none();
-                            };
+                            }
                             self.pending_project = Some(p);
-                            self.project_path = Some(path);
-                            audio_path
+                            self.project_path = Some(path.clone());
+                            resolved
                         }
                         Err(e) => {
                             self.status = e;
@@ -568,7 +591,7 @@ impl App {
                     }
                 } else {
                     // A project saved next to the recording is picked up automatically.
-                    let sidecar = project::sidecar_path(&path);
+                    let sidecar = project::sidecar_path(&paths);
                     self.pending_project = None;
                     self.project_path = None;
                     if sidecar.is_file() {
@@ -580,13 +603,16 @@ impl App {
                             Err(e) => self.status = format!("Ignoring {}: {e}", sidecar.display()),
                         }
                     }
-                    path
+                    paths
                 };
                 self.stop_playback();
                 self.loading = true;
-                self.status = format!("Loading {}…", audio_path.display());
+                self.status = match audio_paths.as_slice() {
+                    [one] => format!("Loading {}…", one.display()),
+                    many => format!("Loading {} files…", many.len()),
+                };
                 return Task::perform(
-                    async move { audio::load(&audio_path).map(Arc::new) },
+                    async move { audio::load_many(&audio_paths).map(Arc::new) },
                     Message::Loaded,
                 );
             }
@@ -595,8 +621,13 @@ impl App {
                 self.loading = false;
                 self.stop_playback();
                 let info = format!(
-                    "Loaded {} — {} tracks, {} Hz, {} bit, {}",
+                    "Loaded {}{} — {} tracks, {} Hz, {} bit, {}",
                     audio.file_name(),
+                    if audio.is_multi_file() {
+                        " (shorter files padded with silence)"
+                    } else {
+                        ""
+                    },
                     audio.channels(),
                     audio.sample_rate,
                     audio.bits_per_sample,
@@ -626,7 +657,11 @@ impl App {
                         );
                     }
                     None => {
-                        self.track_names = project::default_track_names(channels);
+                        self.track_names = self
+                            .audio
+                            .as_ref()
+                            .map(|a| a.default_track_names())
+                            .unwrap_or_default();
                         self.songs.clear();
                         self.next_id = 0;
                         self.dirty = false;
@@ -657,7 +692,7 @@ impl App {
                 let default = self
                     .project_path
                     .clone()
-                    .unwrap_or_else(|| project::sidecar_path(&audio.path));
+                    .unwrap_or_else(|| project::sidecar_path(&audio.sources));
                 return Task::perform(
                     async move {
                         let mut dialog = rfd::AsyncFileDialog::new().add_filter("Project", &["json"]);
@@ -899,7 +934,7 @@ impl App {
                 else {
                     return Task::none();
                 };
-                if audio.path == path {
+                if audio.sources.contains(&path) {
                     self.status = "Refusing to overwrite the loaded recording — pick another name."
                         .to_string();
                     return Task::none();
@@ -1109,7 +1144,7 @@ impl App {
                 text(if self.loading {
                     "Loading…"
                 } else {
-                    "Open a multitrack WAV or FLAC file to see its tracks here."
+                    "Open a multitrack WAV/FLAC, or select several mono/stereo files, to see the tracks here."
                 })
                 .size(16),
             )

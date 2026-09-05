@@ -119,15 +119,16 @@ fn end_to_end() {
     assert!(all_dir.join("02 - Second_ Take_2.flac").is_file());
 
     // Project round trip through JSON, referenced by bare file name.
-    let project_path = project::sidecar_path(&tape_path);
+    let project_path = project::sidecar_path(std::slice::from_ref(&tape_path));
     let project = Project {
-        audio_file: project::audio_reference(&project_path, &tape_path),
+        audio_files: vec![project::audio_reference(&project_path, &tape_path)],
+        audio_file: String::new(),
         sample_rate: SR,
         channels: 4,
         track_names: vec!["Kick".into(), "Bass".into(), "Gtr".into(), "Vox".into()],
         songs: vec![song.clone(), second],
     };
-    assert_eq!(project.audio_file, "tape.wav");
+    assert_eq!(project.audio_files, ["tape.wav"]);
     project::save(&project_path, &project).unwrap();
     let loaded = project::load(&project_path).unwrap();
     assert_eq!(loaded.songs.len(), 2);
@@ -136,9 +137,78 @@ fn end_to_end() {
     assert_eq!(loaded.songs[1].id, 1, "ids are reassigned on load");
     assert_eq!(loaded.track_names[2], "Gtr");
     assert_eq!(
-        project::resolve_audio_path(&project_path, &loaded.audio_file).as_deref(),
+        project::resolve_audio_path(&project_path, &loaded.files()[0]).as_deref(),
         Some(tape_path.as_path())
     );
+
+    // Older single-file projects still load.
+    let legacy = r#"{"audio_file":"tape.wav","sample_rate":44100,"channels":4,"track_names":[],"songs":[]}"#;
+    let legacy_path = dir.join("legacy.mtsplit.json");
+    std::fs::write(&legacy_path, legacy).unwrap();
+    assert_eq!(project::load(&legacy_path).unwrap().files(), ["tape.wav"]);
+}
+
+/// Several mono/stereo files become consecutive tracks, ordered naturally by
+/// name, padded with silence to the longest file.
+#[test]
+fn multi_file_tape() {
+    let dir = std::env::temp_dir().join("multi_track_split_multi");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let tone = |freq: f32, secs: usize, channels: usize| -> Vec<f32> {
+        (0..secs * SR as usize)
+            .flat_map(|i| {
+                let v = 0.5 * (2.0 * std::f32::consts::PI * freq * i as f32 / SR as f32).sin();
+                std::iter::repeat_n(v, channels)
+            })
+            .collect()
+    };
+    // "track 10" must sort after "track 2"; the stereo file is the longest.
+    let files = [
+        ("track 10 vox.wav", 220.0, 6, 1),
+        ("track 2 bass.wav", 330.0, 10, 1),
+        ("track 1 drums.flac", 440.0, 8, 2),
+    ];
+    let mut paths = Vec::new();
+    for (name, freq, secs, ch) in files {
+        let path = dir.join(name);
+        export::write_audio(&path, &tone(freq, secs, ch), ch, 16, SR).unwrap();
+        paths.push(path);
+    }
+
+    let audio = audio::load_many(&paths).expect("load set");
+    assert_eq!(audio.channels(), 4);
+    assert_eq!(audio.frames(), 10 * SR as usize, "padded to the longest file");
+    assert_eq!(audio.source_channels, [2, 1, 1]);
+    assert_eq!(
+        audio.default_track_names(),
+        ["track 1 drums L", "track 1 drums R", "track 2 bass", "track 10 vox"]
+    );
+    assert_eq!(audio.path, dir.join("track 1 drums.flac"));
+    assert!(audio.file_name().starts_with("3 files in "));
+
+    let loud = 0.5 / 2f32.sqrt();
+    // Drums: 8 s of tone on both channels, then silence.
+    assert!((rms(&audio.tracks[0][..secs(8.0)]) - loud).abs() < 0.02);
+    assert!((rms(&audio.tracks[1][..secs(8.0)]) - loud).abs() < 0.02);
+    assert!(rms(&audio.tracks[0][secs(8.0)..]) < 0.001);
+    // Bass fills the whole length; vox stops after 6 s.
+    assert!((rms(&audio.tracks[2][secs(9.0)..]) - loud).abs() < 0.02);
+    assert!((rms(&audio.tracks[3][..secs(6.0)]) - loud).abs() < 0.02);
+    assert!(rms(&audio.tracks[3][secs(6.0)..]) < 0.001);
+
+    // The sidecar for a set is named after the directory.
+    assert_eq!(
+        project::sidecar_path(&audio.sources),
+        dir.join("multi_track_split_multi.mtsplit.json")
+    );
+
+    // Mismatched sample rates are refused.
+    let odd = dir.join("odd.wav");
+    export::write_audio(&odd, &tone(100.0, 1, 1), 1, 16, 48000).unwrap();
+    let err = audio::load_many(&[paths[0].clone(), odd]).unwrap_err();
+    assert!(err.contains("48000 Hz"), "{err}");
 }
 
 #[test]

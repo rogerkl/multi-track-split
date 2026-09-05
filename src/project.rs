@@ -98,8 +98,13 @@ impl Song {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
-    /// File name (or path) of the recording, relative to the project file
-    /// when they sit in the same directory.
+    /// The recording's files in track order (one interleaved file, or several
+    /// mono/stereo files): bare names when they sit next to the project
+    /// file, otherwise full paths.
+    #[serde(default)]
+    pub audio_files: Vec<String>,
+    /// Older projects stored a single file here; kept so they still load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audio_file: String,
     pub sample_rate: u32,
     pub channels: usize,
@@ -107,8 +112,15 @@ pub struct Project {
     pub songs: Vec<Song>,
 }
 
-pub fn default_track_names(channels: usize) -> Vec<String> {
-    (1..=channels).map(|n| format!("Track {n}")).collect()
+impl Project {
+    /// The recording's files, whichever field the project used.
+    pub fn files(&self) -> Vec<String> {
+        if self.audio_files.is_empty() && !self.audio_file.is_empty() {
+            vec![self.audio_file.clone()]
+        } else {
+            self.audio_files.clone()
+        }
+    }
 }
 
 pub fn save(path: &Path, project: &Project) -> Result<(), String> {
@@ -128,13 +140,24 @@ pub fn load(path: &Path) -> Result<Project, String> {
     Ok(project)
 }
 
-/// Default project path for a recording: same directory and stem.
-pub fn sidecar_path(audio_path: &Path) -> PathBuf {
-    let stem = audio_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "tape".to_string());
-    audio_path.with_file_name(format!("{stem}{PROJECT_SUFFIX}"))
+/// Default project path: next to a single recording with its stem, or, for
+/// a set of files, in their directory named after that directory.
+pub fn sidecar_path(audio_paths: &[PathBuf]) -> PathBuf {
+    let first = audio_paths.first().cloned().unwrap_or_default();
+    if audio_paths.len() > 1 {
+        let dir = first.parent().unwrap_or(Path::new("."));
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tape".to_string());
+        dir.join(format!("{name}{PROJECT_SUFFIX}"))
+    } else {
+        let stem = first
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tape".to_string());
+        first.with_file_name(format!("{stem}{PROJECT_SUFFIX}"))
+    }
 }
 
 /// Finds the recording a project refers to: as written (absolute or relative

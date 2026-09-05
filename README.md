@@ -10,7 +10,7 @@ Tape was expensive, so songs often overlap: the end of one song may only use tra
 
 ## Workflow
 
-1. **Open…** a multitrack WAV or FLAC. If a project file (`<name>.mtsplit.json`) sits next to it, it is loaded too.
+1. **Open…** a multitrack WAV or FLAC, or select several mono/stereo files at once: they become tracks 1–n in file-name order (numbers sort numerically), all assumed to start at the same instant, shorter files padded with silence to the longest. A project file saved next to the recording (`<name>.mtsplit.json`, or `<folder>.mtsplit.json` for a set of files) is loaded automatically.
 2. Click in the waveform to place the playhead, press **N** (or *+ Song at playhead*) to add a song. Drag the orange flags in the strip, press **I** / **O** to set the song start / end at the playhead, or type times in the song list (Enter applies).
 3. In the mixer for the selected song, untick tracks the song does not use, and set per-track *In* / *Out* where a track joins late or leaves early (type a time, press *PH* to use the playhead, or drag the track's edge in its lane). Double-clicking a lane toggles the track.
 4. **Play** auditions the selected song with its mix; volume, pan, mute and solo react live.
