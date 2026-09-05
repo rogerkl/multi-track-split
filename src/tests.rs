@@ -81,18 +81,45 @@ fn end_to_end() {
 
     // Mixdown: pan track 0 hard left, track 2 hard right, mute track 1 → the
     // right channel is silent once track 2 has ended at 15 s into the song.
+    // Track 0 is boosted so the left channel exceeds 0 dBFS: the float WAV
+    // must keep that, the FLAC must clamp it and say so.
     let mut mixed = song.clone();
     mixed.tracks[0].pan = -1.0;
+    mixed.tracks[0].volume = 1.5;
     mixed.tracks[1].mute = true;
     mixed.tracks[2].pan = 1.0;
-    let out = dir.join("song (mix).flac");
-    export::export_mixdown(&audio, &mixed, &out).expect("mixdown export");
+    let out = dir.join("song (mix).wav");
+    let msg = export::export_mixdown(&audio, &mixed, &out).expect("mixdown export");
+    assert!(msg.contains("32-bit float"), "{msg}");
     let back = audio::load(&out).unwrap();
     assert_eq!(back.channels(), 2);
+    assert_eq!(back.bits_per_sample, 32);
     assert_eq!(back.frames(), secs(20.0));
-    assert!(rms(&back.tracks[0]) > 0.3, "left carries track 0");
+    let left_peak = back.tracks[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!((left_peak - 0.75).abs() < 0.01, "float keeps the hot mix: {left_peak}");
     assert!(rms(&back.tracks[1][..secs(15.0)]) > 0.3, "right carries track 2");
     assert!(rms(&back.tracks[1][secs(15.0)..]) < 0.001, "right silent after track 2 ends");
+
+    mixed.tracks[0].volume = 2.5; // 0.5 × 2.5 = 1.25 → clips in integer formats
+    let out_flac = dir.join("song (mix).flac");
+    let msg = export::export_mixdown(&audio, &mixed, &out_flac).unwrap();
+    assert!(msg.contains("clipped"), "{msg}");
+    let back = audio::load(&out_flac).unwrap();
+    let left_peak = back.tracks[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!(left_peak <= 1.0 && left_peak > 0.99, "flac clamps: {left_peak}");
+    let out_wav = dir.join("song hot (mix).wav");
+    export::export_mixdown(&audio, &mixed, &out_wav).unwrap();
+    let back = audio::load(&out_wav).unwrap();
+    let left_peak = back.tracks[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!((left_peak - 1.25).abs() < 0.01, "float wav keeps >0 dBFS: {left_peak}");
+
+    // Export all mixes into a folder.
+    let mix_dir = dir.join("mixes");
+    let _ = std::fs::remove_dir_all(&mix_dir);
+    std::fs::create_dir_all(&mix_dir).unwrap();
+    export::export_all_mixdowns(&audio, &[song.clone(), mixed.clone()], &mix_dir).unwrap();
+    assert!(mix_dir.join("01 - Overlap (mix).wav").is_file());
+    assert!(mix_dir.join("02 - Overlap (mix).wav").is_file());
 
     // Solo wins over everything else.
     let mut soloed = song.clone();

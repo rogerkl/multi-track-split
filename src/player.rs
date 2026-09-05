@@ -161,7 +161,7 @@ impl MixSource {
         let to = (self.frame + BLOCK_FRAMES).min(self.end);
         let mixes = self.mix.read().map(|m| m.clone()).unwrap_or_default();
         self.buf.clear();
-        render_stereo(&self.audio, &mixes, self.frame, to, &mut self.buf);
+        render_stereo(&self.audio, &mixes, self.frame, to, true, &mut self.buf);
         self.frame = to;
         self.pos = 0;
         true

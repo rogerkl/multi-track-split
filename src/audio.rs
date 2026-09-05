@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::{self, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -242,7 +242,12 @@ fn decode_file(path: &Path) -> Result<Decoded, String> {
         .channels
         .ok_or_else(|| "Unknown channel layout".to_string())?
         .count();
-    let bits_per_sample = params.bits_per_sample.unwrap_or(16);
+    // Float WAVs carry no bits-per-sample in their codec params.
+    let bits_per_sample = params.bits_per_sample.unwrap_or(match params.codec {
+        codecs::CODEC_TYPE_PCM_F32LE | codecs::CODEC_TYPE_PCM_F32BE => 32,
+        codecs::CODEC_TYPE_PCM_F64LE | codecs::CODEC_TYPE_PCM_F64BE => 64,
+        _ => 16,
+    });
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&params, &DecoderOptions::default())

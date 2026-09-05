@@ -65,13 +65,15 @@ pub fn flat_mixes(channels: usize, frames: usize) -> Vec<TrackMix> {
 }
 
 /// Renders frames `[from, to)` of the stereo mix and appends them to `out`
-/// as interleaved L/R, clamped to [-1, 1]. Returns the peak absolute level
-/// before clamping so callers can report clipping.
+/// as interleaved L/R. With `clamp` the result is limited to [-1, 1] (for
+/// playback); without it the sum is kept as is (for float export). Returns
+/// the peak absolute level before any clamping.
 pub fn render_stereo(
     audio: &AudioData,
     mixes: &[TrackMix],
     from: usize,
     to: usize,
+    clamp: bool,
     out: &mut Vec<f32>,
 ) -> f32 {
     let to = to.min(audio.frames());
@@ -99,7 +101,9 @@ pub fn render_stereo(
     let mut peak = 0.0f32;
     for v in block.iter_mut() {
         peak = peak.max(v.abs());
-        *v = v.clamp(-1.0, 1.0);
+        if clamp {
+            *v = v.clamp(-1.0, 1.0);
+        }
     }
     peak
 }

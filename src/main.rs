@@ -115,6 +115,8 @@ pub enum Message {
     ExportMultiPathChosen(Option<PathBuf>),
     ExportAll,
     ExportAllDirChosen(Option<PathBuf>),
+    ExportAllMixes,
+    ExportAllMixesDirChosen(Option<PathBuf>),
     ExportDone(Result<String, String>),
 
     DeviceSelected(String),
@@ -901,7 +903,7 @@ impl App {
                 let is_mix = matches!(message, Message::ExportMix);
                 let stem = export::song_file_stem(self.song_number(song.id), song);
                 let name = if is_mix {
-                    format!("{stem} (mix).flac")
+                    format!("{stem} (mix).wav")
                 } else if song.active_channels().len() > export::FLAC_MAX_CHANNELS {
                     format!("{stem}.wav")
                 } else {
@@ -912,10 +914,15 @@ impl App {
                     .as_ref()
                     .and_then(|a| a.path.parent().map(|p| p.to_path_buf()));
                 let dialog = async move {
-                    let mut dialog = rfd::AsyncFileDialog::new()
-                        .add_filter("FLAC", &["flac"])
-                        .add_filter("WAV", &["wav"])
-                        .set_file_name(name);
+                    let mut dialog = rfd::AsyncFileDialog::new();
+                    dialog = if is_mix {
+                        dialog
+                            .add_filter("WAV (32-bit float)", &["wav"])
+                            .add_filter("FLAC (integer, clamped)", &["flac"])
+                    } else {
+                        dialog.add_filter("FLAC", &["flac"]).add_filter("WAV", &["wav"])
+                    };
+                    dialog = dialog.set_file_name(name);
                     if let Some(dir) = dir {
                         dialog = dialog.set_directory(dir);
                     }
@@ -953,7 +960,7 @@ impl App {
                 );
             }
             Message::ExportMixPathChosen(None) | Message::ExportMultiPathChosen(None) => {}
-            Message::ExportAll => {
+            Message::ExportAll | Message::ExportAllMixes => {
                 if self.audio.is_none() || self.songs.is_empty() || self.exporting {
                     return Task::none();
                 }
@@ -961,16 +968,18 @@ impl App {
                     .audio
                     .as_ref()
                     .and_then(|a| a.path.parent().map(|p| p.to_path_buf()));
-                return Task::perform(
-                    async move {
-                        let mut dialog = rfd::AsyncFileDialog::new();
-                        if let Some(dir) = dir {
-                            dialog = dialog.set_directory(dir);
-                        }
-                        dialog.pick_folder().await.map(|h| h.path().to_path_buf())
-                    },
-                    Message::ExportAllDirChosen,
-                );
+                let dialog = async move {
+                    let mut dialog = rfd::AsyncFileDialog::new();
+                    if let Some(dir) = dir {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog.pick_folder().await.map(|h| h.path().to_path_buf())
+                };
+                return if matches!(message, Message::ExportAll) {
+                    Task::perform(dialog, Message::ExportAllDirChosen)
+                } else {
+                    Task::perform(dialog, Message::ExportAllMixesDirChosen)
+                };
             }
             Message::ExportAllDirChosen(Some(dir)) => {
                 let Some(audio) = self.audio.clone() else {
@@ -987,6 +996,19 @@ impl App {
                 );
             }
             Message::ExportAllDirChosen(None) => {}
+            Message::ExportAllMixesDirChosen(Some(dir)) => {
+                let Some(audio) = self.audio.clone() else {
+                    return Task::none();
+                };
+                let songs = self.songs.clone();
+                self.exporting = true;
+                self.status = format!("Exporting {} mixes as 32-bit float WAV…", songs.len());
+                return Task::perform(
+                    async move { export::export_all_mixdowns(&audio, &songs, &dir) },
+                    Message::ExportDone,
+                );
+            }
+            Message::ExportAllMixesDirChosen(None) => {}
             Message::ExportDone(result) => {
                 self.exporting = false;
                 self.status = match result {
@@ -1084,8 +1106,12 @@ impl App {
                 .on_press_maybe((selected.is_some() && !self.exporting).then_some(Message::ExportMix)),
             button(text("Export multitrack…"))
                 .on_press_maybe((selected.is_some() && !self.exporting).then_some(Message::ExportMulti)),
-            button(text("Export all songs…")).on_press_maybe(
+            button(text("Export all multitrack…")).on_press_maybe(
                 (has_audio && !self.songs.is_empty() && !self.exporting).then_some(Message::ExportAll)
+            ),
+            button(text("Export all mixes…")).on_press_maybe(
+                (has_audio && !self.songs.is_empty() && !self.exporting)
+                    .then_some(Message::ExportAllMixes)
             ),
         ]
         .spacing(8)

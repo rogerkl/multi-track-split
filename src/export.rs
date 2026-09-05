@@ -1,7 +1,9 @@
 //! Song export: a stereo mixdown (the simple mix, as heard in playback) or a
 //! multitrack file holding only the tracks a song uses, each silent outside
 //! its own start/end. Format is picked from the file extension: `.flac`
-//! (up to 8 channels) or `.wav`.
+//! (up to 8 channels) or `.wav`. Multitrack files keep the recording's
+//! integer bit depth; mixdowns go to 32-bit float WAV so the sum of the
+//! tracks never clips (FLAC mixdowns are integer and clamped).
 
 use std::io::Write;
 use std::path::Path;
@@ -101,7 +103,8 @@ pub fn render_multitrack(audio: &AudioData, song: &Song) -> Result<(Vec<f32>, us
     Ok((out, n))
 }
 
-/// Interleaved stereo mixdown of the song plus the pre-clamp peak level.
+/// Interleaved stereo mixdown of the song plus its peak level. The samples
+/// are not clamped; integer writers clamp when quantizing.
 pub fn render_mixdown(audio: &AudioData, song: &Song) -> Result<(Vec<f32>, f32), String> {
     let end = song.end.min(audio.frames());
     if end <= song.start {
@@ -112,7 +115,7 @@ pub fn render_mixdown(audio: &AudioData, song: &Song) -> Result<(Vec<f32>, f32),
         return Err("Nothing to mix: every track is inactive or muted".to_string());
     }
     let mut out = Vec::with_capacity(2 * (end - song.start));
-    let peak = mix::render_stereo(audio, &mixes, song.start, end, &mut out);
+    let peak = mix::render_stereo(audio, &mixes, song.start, end, false, &mut out);
     Ok((out, peak))
 }
 
@@ -141,7 +144,7 @@ pub fn write_audio(
 
     let bytes = match format {
         Format::Flac => encode_flac(&quantized, channels, bits as usize, sample_rate as usize)?,
-        Format::Wav => encode_wav(&quantized, channels, bits, sample_rate)?,
+        Format::Wav => encode_wav(&WavSamples::Int(&quantized), channels, bits, sample_rate)?,
     };
     std::fs::write(path, bytes).map_err(|e| format!("Cannot write {}: {e}", path.display()))
 }
@@ -156,15 +159,53 @@ pub fn export_multitrack(audio: &AudioData, song: &Song, path: &Path) -> Result<
     ))
 }
 
+/// Writes a 32-bit float WAV; nothing is clamped, so hot mixes survive.
+pub fn write_float_wav(
+    path: &Path,
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let bytes = encode_wav(&WavSamples::Float(samples), channels, 32, sample_rate)?;
+    std::fs::write(path, bytes).map_err(|e| format!("Cannot write {}: {e}", path.display()))
+}
+
+/// Stereo mixdown: 32-bit float WAV for `.wav`, or an integer FLAC at the
+/// recording's bit depth for `.flac` (clamped, with a warning when it clips).
 pub fn export_mixdown(audio: &AudioData, song: &Song, path: &Path) -> Result<String, String> {
+    let format = Format::from_path(path)?;
     let (samples, peak) = render_mixdown(audio, song)?;
-    write_audio(path, &samples, 2, audio.bits_per_sample, audio.sample_rate)?;
-    let clip_note = if peak > 1.0 {
-        format!(" Warning: mix peaked at {:+.1} dB and was clipped.", 20.0 * peak.log10())
-    } else {
-        String::new()
-    };
-    Ok(format!("Wrote {}.{clip_note}", path.display()))
+    let peak_db = 20.0 * peak.max(1e-9).log10();
+    match format {
+        Format::Wav => {
+            write_float_wav(path, &samples, 2, audio.sample_rate)?;
+            Ok(format!(
+                "Wrote {} (32-bit float, peak {peak_db:+.1} dB).",
+                path.display()
+            ))
+        }
+        Format::Flac => {
+            write_audio(path, &samples, 2, audio.bits_per_sample, audio.sample_rate)?;
+            let clip_note = if peak > 1.0 {
+                format!(" Warning: mix peaked at {peak_db:+.1} dB and was clipped; export as .wav for float.")
+            } else {
+                String::new()
+            };
+            Ok(format!("Wrote {}.{clip_note}", path.display()))
+        }
+    }
+}
+
+/// Exports every song's mixdown as 32-bit float WAV into `dir`, named
+/// `NN - Title (mix).wav`.
+pub fn export_all_mixdowns(audio: &AudioData, songs: &[Song], dir: &Path) -> Result<String, String> {
+    let mut written = 0;
+    for (i, song) in songs.iter().enumerate() {
+        let path = dir.join(format!("{} (mix).wav", song_file_stem(i + 1, song)));
+        export_mixdown(audio, song, &path).map_err(|e| format!("Song {}: {e}", i + 1))?;
+        written += 1;
+    }
+    Ok(format!("Exported {written} float WAV mixes to {}.", dir.display()))
 }
 
 /// Exports every song as a multitrack file into `dir`, named `NN - Title`.
@@ -219,16 +260,28 @@ fn encode_flac(
     Ok(bytes)
 }
 
-/// PCM WAV; WAVE_FORMAT_EXTENSIBLE for more than two channels (what DAWs
-/// expect for multichannel files), plain WAVE_FORMAT_PCM otherwise.
+/// Sample payload for `encode_wav`: little-endian integers of the given bit
+/// depth, or IEEE 32-bit floats.
+enum WavSamples<'a> {
+    Int(&'a [i32]),
+    Float(&'a [f32]),
+}
+
+/// WAV writer. WAVE_FORMAT_EXTENSIBLE is used for more than two channels
+/// (what DAWs expect for multichannel files); otherwise plain PCM or plain
+/// IEEE float.
 fn encode_wav(
-    samples: &[i32],
+    samples: &WavSamples<'_>,
     channels: usize,
     bits: u32,
     sample_rate: u32,
 ) -> Result<Vec<u8>, String> {
+    let (count, is_float) = match samples {
+        WavSamples::Int(s) => (s.len(), false),
+        WavSamples::Float(s) => (s.len(), true),
+    };
     let bytes_per_sample = (bits / 8) as usize;
-    let data_len = samples.len() * bytes_per_sample;
+    let data_len = count * bytes_per_sample;
     let extensible = channels > 2;
     let fmt_len: u32 = if extensible { 40 } else { 16 };
     let riff_len = 4 + (8 + fmt_len as usize) + (8 + data_len);
@@ -237,6 +290,11 @@ fn encode_wav(
     }
     let block_align = (channels * bytes_per_sample) as u16;
     let byte_rate = sample_rate * block_align as u32;
+    let format_tag: u16 = match (extensible, is_float) {
+        (true, _) => 0xFFFE,
+        (false, false) => 1,
+        (false, true) => 3,
+    };
 
     let mut out = Vec::with_capacity(riff_len + 8);
     let w = &mut out;
@@ -246,7 +304,7 @@ fn encode_wav(
     write(w, b"WAVE");
     write(w, b"fmt ");
     write(w, &fmt_len.to_le_bytes());
-    write(w, &(if extensible { 0xFFFEu16 } else { 1u16 }).to_le_bytes());
+    write(w, &format_tag.to_le_bytes());
     write(w, &(channels as u16).to_le_bytes());
     write(w, &sample_rate.to_le_bytes());
     write(w, &byte_rate.to_le_bytes());
@@ -259,20 +317,31 @@ fn encode_wav(
         // have no speaker positions; this just keeps readers happy.
         let mask: u32 = if channels >= 32 { u32::MAX } else { (1u32 << channels) - 1 };
         write(w, &mask.to_le_bytes());
-        // KSDATAFORMAT_SUBTYPE_PCM
+        // KSDATAFORMAT_SUBTYPE_PCM / KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: they
+        // differ only in the first byte.
         write(
             w,
             &[
-                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38,
+                if is_float { 0x03 } else { 0x01 },
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38,
                 0x9b, 0x71,
             ],
         );
     }
     write(w, b"data");
     write(w, &(data_len as u32).to_le_bytes());
-    for &s in samples {
-        let b = s.to_le_bytes();
-        write(w, &b[..bytes_per_sample]);
+    match samples {
+        WavSamples::Int(s) => {
+            for &v in *s {
+                let b = v.to_le_bytes();
+                write(w, &b[..bytes_per_sample]);
+            }
+        }
+        WavSamples::Float(s) => {
+            for &v in *s {
+                write(w, &v.to_le_bytes());
+            }
+        }
     }
     Ok(out)
 }
