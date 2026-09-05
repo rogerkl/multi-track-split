@@ -12,14 +12,81 @@ use flacenc::bitsink::ByteSink;
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 
+use serde::{Deserialize, Serialize};
+
 use crate::audio::AudioData;
 use crate::mix;
 use crate::project::Song;
 
+/// Peak level normalized mixes are scaled to, leaving a little headroom
+/// for inter-sample peaks and lossy transcodes.
+pub const NORMALIZE_TARGET_DB: f32 = -1.0;
+
+/// How stereo mixdowns are written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MixFormat {
+    /// 32-bit float WAV; nothing is scaled or clamped.
+    Float32,
+    /// Integer file at `bits` (16 or 24), the mix scaled so its peak sits at
+    /// `NORMALIZE_TARGET_DB`.
+    Normalized { format: Format, bits: u32 },
+}
+
+impl MixFormat {
+    pub const ALL: [MixFormat; 5] = [
+        MixFormat::Float32,
+        MixFormat::Normalized {
+            format: Format::Wav,
+            bits: 24,
+        },
+        MixFormat::Normalized {
+            format: Format::Wav,
+            bits: 16,
+        },
+        MixFormat::Normalized {
+            format: Format::Flac,
+            bits: 24,
+        },
+        MixFormat::Normalized {
+            format: Format::Flac,
+            bits: 16,
+        },
+    ];
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            MixFormat::Float32 => "wav",
+            MixFormat::Normalized { format, .. } => format.extension(),
+        }
+    }
+}
+
+impl Default for MixFormat {
+    fn default() -> Self {
+        MixFormat::Float32
+    }
+}
+
+impl std::fmt::Display for MixFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MixFormat::Float32 => write!(f, "WAV 32-bit float"),
+            MixFormat::Normalized { format, bits } => write!(
+                f,
+                "{} {bits}-bit, normalized",
+                match format {
+                    Format::Wav => "WAV",
+                    Format::Flac => "FLAC",
+                }
+            ),
+        }
+    }
+}
+
 /// FLAC's channel limit (and flacenc's).
 pub const FLAC_MAX_CHANNELS: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Format {
     Wav,
     Flac,
@@ -170,42 +237,61 @@ pub fn write_float_wav(
     std::fs::write(path, bytes).map_err(|e| format!("Cannot write {}: {e}", path.display()))
 }
 
-/// Stereo mixdown: 32-bit float WAV for `.wav`, or an integer FLAC at the
-/// recording's bit depth for `.flac` (clamped, with a warning when it clips).
-pub fn export_mixdown(audio: &AudioData, song: &Song, path: &Path) -> Result<String, String> {
+/// Stereo mixdown. The container follows the file extension; `mode` decides
+/// between float (WAV only) and a normalized integer file.
+pub fn export_mixdown(
+    audio: &AudioData,
+    song: &Song,
+    path: &Path,
+    mode: MixFormat,
+) -> Result<String, String> {
     let format = Format::from_path(path)?;
-    let (samples, peak) = render_mixdown(audio, song)?;
+    let (mut samples, peak) = render_mixdown(audio, song)?;
     let peak_db = 20.0 * peak.max(1e-9).log10();
-    match format {
-        Format::Wav => {
+    match mode {
+        MixFormat::Float32 => {
+            if format == Format::Flac {
+                return Err(
+                    "FLAC cannot hold 32-bit float; pick a normalized mix format or a .wav name"
+                        .to_string(),
+                );
+            }
             write_float_wav(path, &samples, 2, audio.sample_rate)?;
             Ok(format!(
                 "Wrote {} (32-bit float, peak {peak_db:+.1} dB).",
                 path.display()
             ))
         }
-        Format::Flac => {
-            write_audio(path, &samples, 2, audio.bits_per_sample, audio.sample_rate)?;
-            let clip_note = if peak > 1.0 {
-                format!(" Warning: mix peaked at {peak_db:+.1} dB and was clipped; export as .wav for float.")
-            } else {
-                String::new()
-            };
-            Ok(format!("Wrote {}.{clip_note}", path.display()))
+        MixFormat::Normalized { bits, .. } => {
+            let target = 10f32.powf(NORMALIZE_TARGET_DB / 20.0);
+            let gain = if peak > 0.0 { target / peak } else { 1.0 };
+            for v in &mut samples {
+                *v *= gain;
+            }
+            write_audio(path, &samples, 2, bits, audio.sample_rate)?;
+            Ok(format!(
+                "Wrote {} ({bits}-bit, normalized {:+.1} dB to a {NORMALIZE_TARGET_DB:.0} dBFS peak).",
+                path.display(),
+                20.0 * gain.log10()
+            ))
         }
     }
 }
 
-/// Exports every song's mixdown as 32-bit float WAV into `dir`, named
-/// `NN - Title (mix).wav`.
-pub fn export_all_mixdowns(audio: &AudioData, songs: &[Song], dir: &Path) -> Result<String, String> {
+/// Exports every song's mixdown into `dir`, named `NN - Title (mix).<ext>`.
+pub fn export_all_mixdowns(
+    audio: &AudioData,
+    songs: &[Song],
+    dir: &Path,
+    mode: MixFormat,
+) -> Result<String, String> {
     let mut written = 0;
     for (i, song) in songs.iter().enumerate() {
-        let path = dir.join(format!("{} (mix).wav", song_file_stem(i + 1, song)));
-        export_mixdown(audio, song, &path).map_err(|e| format!("Song {}: {e}", i + 1))?;
+        let path = dir.join(format!("{} (mix).{}", song_file_stem(i + 1, song), mode.extension()));
+        export_mixdown(audio, song, &path, mode).map_err(|e| format!("Song {}: {e}", i + 1))?;
         written += 1;
     }
-    Ok(format!("Exported {written} float WAV mixes to {}.", dir.display()))
+    Ok(format!("Exported {written} mixes ({mode}) to {}.", dir.display()))
 }
 
 /// Exports every song as a multitrack file into `dir`, named `NN - Title`.

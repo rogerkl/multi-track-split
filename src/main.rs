@@ -120,6 +120,7 @@ pub enum Message {
     ExportDone(Result<String, String>),
 
     DeviceSelected(String),
+    MixFormatSelected(export::MixFormat),
 }
 
 const DEFAULT_DEVICE: &str = "System default";
@@ -159,6 +160,8 @@ struct App {
     live_mix: LiveMix,
     devices: Vec<String>,
     selected_device: String,
+    /// How mixdowns are written (float, or normalized integer).
+    mix_format: export::MixFormat,
 
     status: String,
 }
@@ -193,6 +196,7 @@ impl Default for App {
                 d
             },
             selected_device: DEFAULT_DEVICE.to_string(),
+            mix_format: export::MixFormat::default(),
             status: "Open a multitrack WAV/FLAC, several mono/stereo files, or a saved project to get started."
                 .to_string(),
         }
@@ -459,6 +463,7 @@ impl App {
             channels: audio.channels(),
             track_names: self.track_names.clone(),
             songs: self.songs.clone(),
+            mix_format: Some(self.mix_format),
         })
     }
 
@@ -488,6 +493,9 @@ impl App {
             }
         }
         self.track_names = names;
+        if let Some(mode) = project.mix_format {
+            self.mix_format = mode;
+        }
         self.songs = project.songs;
         for (i, song) in self.songs.iter_mut().enumerate() {
             song.id = i as u64;
@@ -903,7 +911,7 @@ impl App {
                 let is_mix = matches!(message, Message::ExportMix);
                 let stem = export::song_file_stem(self.song_number(song.id), song);
                 let name = if is_mix {
-                    format!("{stem} (mix).wav")
+                    format!("{stem} (mix).{}", self.mix_format.extension())
                 } else if song.active_channels().len() > export::FLAC_MAX_CHANNELS {
                     format!("{stem}.wav")
                 } else {
@@ -913,14 +921,17 @@ impl App {
                     .audio
                     .as_ref()
                     .and_then(|a| a.path.parent().map(|p| p.to_path_buf()));
+                let mix_format = self.mix_format;
                 let dialog = async move {
                     let mut dialog = rfd::AsyncFileDialog::new();
-                    dialog = if is_mix {
-                        dialog
-                            .add_filter("WAV (32-bit float)", &["wav"])
-                            .add_filter("FLAC (integer, clamped)", &["flac"])
-                    } else {
-                        dialog.add_filter("FLAC", &["flac"]).add_filter("WAV", &["wav"])
+                    dialog = match (is_mix, mix_format) {
+                        (true, export::MixFormat::Float32) => {
+                            dialog.add_filter("WAV (32-bit float)", &["wav"])
+                        }
+                        (true, _) if mix_format.extension() == "wav" => {
+                            dialog.add_filter("WAV", &["wav"]).add_filter("FLAC", &["flac"])
+                        }
+                        _ => dialog.add_filter("FLAC", &["flac"]).add_filter("WAV", &["wav"]),
                     };
                     dialog = dialog.set_file_name(name);
                     if let Some(dir) = dir {
@@ -937,6 +948,7 @@ impl App {
             Message::ExportMixPathChosen(Some(ref path)) | Message::ExportMultiPathChosen(Some(ref path)) => {
                 let is_mix = matches!(message, Message::ExportMixPathChosen(_));
                 let path = path.clone();
+                let mix_format = self.mix_format;
                 let (Some(audio), Some(song)) = (self.audio.clone(), self.selected_song().cloned())
                 else {
                     return Task::none();
@@ -951,7 +963,7 @@ impl App {
                 return Task::perform(
                     async move {
                         if is_mix {
-                            export::export_mixdown(&audio, &song, &path)
+                            export::export_mixdown(&audio, &song, &path, mix_format)
                         } else {
                             export::export_multitrack(&audio, &song, &path)
                         }
@@ -1001,10 +1013,11 @@ impl App {
                     return Task::none();
                 };
                 let songs = self.songs.clone();
+                let mode = self.mix_format;
                 self.exporting = true;
-                self.status = format!("Exporting {} mixes as 32-bit float WAV…", songs.len());
+                self.status = format!("Exporting {} mixes ({mode})…", songs.len());
                 return Task::perform(
-                    async move { export::export_all_mixdowns(&audio, &songs, &dir) },
+                    async move { export::export_all_mixdowns(&audio, &songs, &dir, mode) },
                     Message::ExportDone,
                 );
             }
@@ -1017,6 +1030,10 @@ impl App {
                 };
             }
 
+            Message::MixFormatSelected(mode) => {
+                self.mix_format = mode;
+                self.dirty = true;
+            }
             Message::DeviceSelected(name) => {
                 self.stop_playback();
                 self.selected_device = name.clone();
@@ -1102,6 +1119,13 @@ impl App {
             button(text("End = playhead (O)"))
                 .on_press_maybe(selected.map(|_| Message::SongEndToPlayhead)),
             horizontal_space(),
+            text("Mix as").size(13),
+            pick_list(
+                export::MixFormat::ALL,
+                Some(self.mix_format),
+                Message::MixFormatSelected,
+            )
+            .text_size(13),
             button(text("Export mix…"))
                 .on_press_maybe((selected.is_some() && !self.exporting).then_some(Message::ExportMix)),
             button(text("Export multitrack…"))

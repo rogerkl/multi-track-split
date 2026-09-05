@@ -110,6 +110,9 @@ pub struct Project {
     pub channels: usize,
     pub track_names: Vec<String>,
     pub songs: Vec<Song>,
+    /// How "Export mix" writes files; absent in older projects.
+    #[serde(default)]
+    pub mix_format: Option<crate::export::MixFormat>,
 }
 
 impl Project {

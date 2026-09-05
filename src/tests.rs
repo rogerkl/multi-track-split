@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::audio::{self, parse_time};
-use crate::export::{self, Format};
+use crate::export::{self, Format, MixFormat};
 use crate::mix;
 use crate::project::{self, Project, Song};
 
@@ -89,7 +89,8 @@ fn end_to_end() {
     mixed.tracks[1].mute = true;
     mixed.tracks[2].pan = 1.0;
     let out = dir.join("song (mix).wav");
-    let msg = export::export_mixdown(&audio, &mixed, &out).expect("mixdown export");
+    let msg =
+        export::export_mixdown(&audio, &mixed, &out, MixFormat::Float32).expect("mixdown export");
     assert!(msg.contains("32-bit float"), "{msg}");
     let back = audio::load(&out).unwrap();
     assert_eq!(back.channels(), 2);
@@ -100,26 +101,69 @@ fn end_to_end() {
     assert!(rms(&back.tracks[1][..secs(15.0)]) > 0.3, "right carries track 2");
     assert!(rms(&back.tracks[1][secs(15.0)..]) < 0.001, "right silent after track 2 ends");
 
-    mixed.tracks[0].volume = 2.5; // 0.5 × 2.5 = 1.25 → clips in integer formats
-    let out_flac = dir.join("song (mix).flac");
-    let msg = export::export_mixdown(&audio, &mixed, &out_flac).unwrap();
-    assert!(msg.contains("clipped"), "{msg}");
-    let back = audio::load(&out_flac).unwrap();
-    let left_peak = back.tracks[0].iter().fold(0f32, |m, v| m.max(v.abs()));
-    assert!(left_peak <= 1.0 && left_peak > 0.99, "flac clamps: {left_peak}");
+    mixed.tracks[0].volume = 2.5; // 0.5 × 2.5 = 1.25 → would clip in integer formats
     let out_wav = dir.join("song hot (mix).wav");
-    export::export_mixdown(&audio, &mixed, &out_wav).unwrap();
+    export::export_mixdown(&audio, &mixed, &out_wav, MixFormat::Float32).unwrap();
     let back = audio::load(&out_wav).unwrap();
     let left_peak = back.tracks[0].iter().fold(0f32, |m, v| m.max(v.abs()));
     assert!((left_peak - 1.25).abs() < 0.01, "float wav keeps >0 dBFS: {left_peak}");
 
-    // Export all mixes into a folder.
+    // Float cannot go into FLAC.
+    let err = export::export_mixdown(&audio, &mixed, &dir.join("x.flac"), MixFormat::Float32)
+        .unwrap_err();
+    assert!(err.contains("float"), "{err}");
+
+    // Normalized integer exports land at the -1 dBFS target, whether the
+    // mix was too hot (scaled down) or quiet (scaled up).
+    let target = 10f32.powf(export::NORMALIZE_TARGET_DB / 20.0);
+    for (name, mode, bits) in [
+        ("hot16.wav", MixFormat::Normalized { format: Format::Wav, bits: 16 }, 16),
+        ("hot24.flac", MixFormat::Normalized { format: Format::Flac, bits: 24 }, 24),
+    ] {
+        let out = dir.join(name);
+        let msg = export::export_mixdown(&audio, &mixed, &out, mode).unwrap();
+        assert!(msg.contains("normalized -"), "{msg}");
+        let back = audio::load(&out).unwrap();
+        assert_eq!(back.bits_per_sample, bits, "{name}");
+        let left_peak = back.tracks[0].iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!((left_peak - target).abs() < 0.002, "{name} normalized peak {left_peak}");
+    }
+    let mut quiet = mixed.clone();
+    quiet.tracks[0].volume = 0.1;
+    let out = dir.join("quiet.wav");
+    let msg = export::export_mixdown(
+        &audio,
+        &quiet,
+        &out,
+        MixFormat::Normalized { format: Format::Wav, bits: 24 },
+    )
+    .unwrap();
+    assert!(msg.contains("normalized +"), "{msg}");
+    let back = audio::load(&out).unwrap();
+    // Track 2 on the right is now the loudest part of the mix.
+    let peak = back
+        .tracks
+        .iter()
+        .flatten()
+        .fold(0f32, |m, v| m.max(v.abs()));
+    assert!((peak - target).abs() < 0.002, "quiet mix raised to target: {peak}");
+
+    // Export all mixes into a folder, in the chosen format.
     let mix_dir = dir.join("mixes");
     let _ = std::fs::remove_dir_all(&mix_dir);
     std::fs::create_dir_all(&mix_dir).unwrap();
-    export::export_all_mixdowns(&audio, &[song.clone(), mixed.clone()], &mix_dir).unwrap();
+    export::export_all_mixdowns(&audio, &[song.clone(), mixed.clone()], &mix_dir, MixFormat::Float32)
+        .unwrap();
     assert!(mix_dir.join("01 - Overlap (mix).wav").is_file());
     assert!(mix_dir.join("02 - Overlap (mix).wav").is_file());
+    export::export_all_mixdowns(
+        &audio,
+        &[song.clone()],
+        &mix_dir,
+        MixFormat::Normalized { format: Format::Flac, bits: 16 },
+    )
+    .unwrap();
+    assert!(mix_dir.join("01 - Overlap (mix).flac").is_file());
 
     // Solo wins over everything else.
     let mut soloed = song.clone();
@@ -154,6 +198,7 @@ fn end_to_end() {
         channels: 4,
         track_names: vec!["Kick".into(), "Bass".into(), "Gtr".into(), "Vox".into()],
         songs: vec![song.clone(), second],
+        mix_format: Some(MixFormat::Normalized { format: Format::Flac, bits: 24 }),
     };
     assert_eq!(project.audio_files, ["tape.wav"]);
     project::save(&project_path, &project).unwrap();
@@ -163,6 +208,7 @@ fn end_to_end() {
     assert_eq!(loaded.songs[0].start, song.start);
     assert_eq!(loaded.songs[1].id, 1, "ids are reassigned on load");
     assert_eq!(loaded.track_names[2], "Gtr");
+    assert_eq!(loaded.mix_format, project.mix_format);
     assert_eq!(
         project::resolve_audio_path(&project_path, &loaded.files()[0]).as_deref(),
         Some(tape_path.as_path())
