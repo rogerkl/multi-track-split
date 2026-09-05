@@ -1,0 +1,38 @@
+# Multi Track Split
+
+A small desktop tool for organizing backups of multitrack tape recordings (4-, 8- or more-track interleaved WAV/FLAC) into songs, auditioning them with a simple mix, and exporting each song for remixing.
+
+Tape was expensive, so songs often overlap: the end of one song may only use tracks 1–4 while the next one already starts on tracks 5–8. A plain start/end split cannot express that. Here a **song** is a time range on the tape plus, for each tape track:
+
+- whether the song **uses** that track at all,
+- an optional **track start / end** inside the song (e.g. "this track only belongs to the song from 0:20 on"),
+- a **volume** and **pan** for the quick stereo mix, with mute/solo for auditioning.
+
+## Workflow
+
+1. **Open…** a multitrack WAV or FLAC. If a project file (`<name>.mtsplit.json`) sits next to it, it is loaded too.
+2. Click in the waveform to place the playhead, press **N** (or *+ Song at playhead*) to add a song. Drag the orange flags in the strip, press **I** / **O** to set the song start / end at the playhead, or type times in the song list (Enter applies).
+3. In the mixer for the selected song, untick tracks the song does not use, and set per-track *In* / *Out* where a track joins late or leaves early (type a time, press *PH* to use the playhead, or drag the track's edge in its lane). Double-clicking a lane toggles the track.
+4. **Play** auditions the selected song with its mix; volume, pan, mute and solo react live.
+5. **Save project** writes the JSON sidecar. **Export mix…** writes a stereo FLAC/WAV of the song. **Export multitrack…** writes a FLAC/WAV containing only the tracks the song uses, in tape order, each silent outside its own in/out range, so a track that joins 20 seconds in is silent for its first 20 seconds. **Export all songs…** writes one multitrack file per song into a folder (`NN - Title.flac`, WAV when a song uses more than 8 tracks, FLAC's limit).
+
+Exports keep the recording's sample rate and bit depth (16–24 bit).
+
+## Shortcuts
+
+Space play/pause · ←/→ step · N new song · I/O song start/end at playhead · +/- zoom · Shift +/- amplitude zoom · wheel zoom · Shift+wheel pan. Shortcuts are inactive while a text field is focused.
+
+## Building
+
+```sh
+cargo build --release          # target/release/multi-track-split
+cargo test
+```
+
+Linux needs ALSA headers (`sudo apt install libasound2-dev pkg-config`). Windows cross-build from Linux with `mingw-w64` installed:
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+The whole recording is decoded into memory as 32-bit float: an 8-track, 24-bit, 48 kHz, 45-minute tape takes about 4 GB of RAM.

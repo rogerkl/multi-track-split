@@ -1,0 +1,168 @@
+use std::path::Path;
+
+use crate::audio::{self, parse_time};
+use crate::export::{self, Format};
+use crate::mix;
+use crate::project::{self, Project, Song};
+
+const SR: u32 = 44100;
+const TONES: [f32; 4] = [220.0, 330.0, 440.0, 550.0];
+
+/// A 30 s four-track WAV: each track carries its own continuous sine tone.
+fn make_test_tape(dir: &Path) -> std::path::PathBuf {
+    let frames = 30 * SR as usize;
+    let mut samples = Vec::with_capacity(frames * TONES.len());
+    for i in 0..frames {
+        let t = i as f32 / SR as f32;
+        for &freq in &TONES {
+            samples.push(0.5 * (2.0 * std::f32::consts::PI * freq * t).sin());
+        }
+    }
+    let path = dir.join("tape.wav");
+    export::write_audio(&path, &samples, TONES.len(), 16, SR).unwrap();
+    path
+}
+
+fn rms(track: &[f32]) -> f32 {
+    (track.iter().map(|s| s * s).sum::<f32>() / track.len().max(1) as f32).sqrt()
+}
+
+fn secs(s: f64) -> usize {
+    (s * SR as f64) as usize
+}
+
+/// Song from 5 s to 25 s: track 1 starts 10 s in, track 2 ends 5 s early,
+/// track 3 is not used at all.
+fn test_song() -> Song {
+    let mut song = Song::new(0, "Overlap".to_string(), secs(5.0), secs(25.0), TONES.len());
+    song.tracks[1].start = Some(secs(15.0));
+    song.tracks[2].end = Some(secs(20.0));
+    song.tracks[3].active = false;
+    song
+}
+
+#[test]
+fn end_to_end() {
+    let dir = std::env::temp_dir().join("multi_track_split_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tape_path = make_test_tape(&dir);
+
+    let audio = audio::load(&tape_path).expect("load test tape");
+    assert_eq!(audio.channels(), 4);
+    assert_eq!(audio.frames(), 30 * SR as usize);
+    assert_eq!(audio.sample_rate, SR);
+
+    let song = test_song();
+    assert_eq!(song.track_range(0), Some((secs(5.0), secs(25.0))));
+    assert_eq!(song.track_range(1), Some((secs(15.0), secs(25.0))));
+    assert_eq!(song.track_range(2), Some((secs(5.0), secs(20.0))));
+    assert_eq!(song.track_range(3), None);
+
+    // Multitrack export in both formats: 3 tracks, 20 s, with silence where
+    // a track is not (yet / any more) part of the song.
+    for ext in ["flac", "wav"] {
+        let out = dir.join(format!("song.{ext}"));
+        export::export_multitrack(&audio, &song, &out).expect("multitrack export");
+        let back = audio::load(&out).expect("decode exported multitrack");
+        assert_eq!(back.channels(), 3, "{ext}: only active tracks are exported");
+        assert_eq!(back.frames(), secs(20.0), "{ext}: song length");
+
+        let loud = 0.5 / 2f32.sqrt();
+        // Track 0: tone throughout.
+        assert!((rms(&back.tracks[0][..secs(5.0)]) - loud).abs() < 0.02, "{ext}");
+        assert!((rms(&back.tracks[0][secs(15.0)..]) - loud).abs() < 0.02, "{ext}");
+        // Track 1 (tape track 2): silent for its first 10 s, then tone.
+        assert!(rms(&back.tracks[1][..secs(10.0)]) < 0.001, "{ext}: leading silence");
+        assert!((rms(&back.tracks[1][secs(10.0)..]) - loud).abs() < 0.02, "{ext}");
+        // Track 2 (tape track 3): tone for 15 s, then silent.
+        assert!((rms(&back.tracks[2][..secs(15.0)]) - loud).abs() < 0.02, "{ext}");
+        assert!(rms(&back.tracks[2][secs(15.0)..]) < 0.001, "{ext}: trailing silence");
+    }
+
+    // Mixdown: pan track 0 hard left, track 2 hard right, mute track 1 → the
+    // right channel is silent once track 2 has ended at 15 s into the song.
+    let mut mixed = song.clone();
+    mixed.tracks[0].pan = -1.0;
+    mixed.tracks[1].mute = true;
+    mixed.tracks[2].pan = 1.0;
+    let out = dir.join("song (mix).flac");
+    export::export_mixdown(&audio, &mixed, &out).expect("mixdown export");
+    let back = audio::load(&out).unwrap();
+    assert_eq!(back.channels(), 2);
+    assert_eq!(back.frames(), secs(20.0));
+    assert!(rms(&back.tracks[0]) > 0.3, "left carries track 0");
+    assert!(rms(&back.tracks[1][..secs(15.0)]) > 0.3, "right carries track 2");
+    assert!(rms(&back.tracks[1][secs(15.0)..]) < 0.001, "right silent after track 2 ends");
+
+    // Solo wins over everything else.
+    let mut soloed = song.clone();
+    soloed.tracks[2].solo = true;
+    let mixes = mix::song_mixes(&soloed);
+    assert_eq!(mixes.len(), 1);
+    assert_eq!(mixes[0].channel, 2);
+
+    // FLAC is limited to 8 channels; a 9-track song must be refused.
+    let wide = Song::new(1, "wide".into(), 0, 100, 9);
+    let err = export::write_audio(&dir.join("wide.flac"), &vec![0.0; 900], 9, 16, SR).unwrap_err();
+    assert!(err.contains("8 channels"), "{err}");
+    assert_eq!(wide.active_channels().len(), 9);
+
+    // Export-all names files by number and title.
+    let all_dir = dir.join("all");
+    let _ = std::fs::remove_dir_all(&all_dir);
+    std::fs::create_dir_all(&all_dir).unwrap();
+    let mut second = Song::new(1, "Second: Take/2".into(), secs(20.0), secs(30.0), 4);
+    second.tracks[0].active = false;
+    export::export_all_multitrack(&audio, &[song.clone(), second.clone()], &all_dir, Format::Flac)
+        .unwrap();
+    assert!(all_dir.join("01 - Overlap.flac").is_file());
+    assert!(all_dir.join("02 - Second_ Take_2.flac").is_file());
+
+    // Project round trip through JSON, referenced by bare file name.
+    let project_path = project::sidecar_path(&tape_path);
+    let project = Project {
+        audio_file: project::audio_reference(&project_path, &tape_path),
+        sample_rate: SR,
+        channels: 4,
+        track_names: vec!["Kick".into(), "Bass".into(), "Gtr".into(), "Vox".into()],
+        songs: vec![song.clone(), second],
+    };
+    assert_eq!(project.audio_file, "tape.wav");
+    project::save(&project_path, &project).unwrap();
+    let loaded = project::load(&project_path).unwrap();
+    assert_eq!(loaded.songs.len(), 2);
+    assert_eq!(loaded.songs[0].tracks, song.tracks);
+    assert_eq!(loaded.songs[0].start, song.start);
+    assert_eq!(loaded.songs[1].id, 1, "ids are reassigned on load");
+    assert_eq!(loaded.track_names[2], "Gtr");
+    assert_eq!(
+        project::resolve_audio_path(&project_path, &loaded.audio_file).as_deref(),
+        Some(tape_path.as_path())
+    );
+}
+
+#[test]
+fn time_parsing() {
+    assert_eq!(parse_time("90"), Some(90.0));
+    assert_eq!(parse_time("1:30"), Some(90.0));
+    assert_eq!(parse_time("01:30.500"), Some(90.5));
+    assert_eq!(parse_time("1:01:30"), Some(3690.0));
+    assert_eq!(parse_time(" 0:05 "), Some(5.0));
+    assert_eq!(parse_time("abc"), None);
+    assert_eq!(parse_time("1:2:3:4"), None);
+    assert_eq!(parse_time("-5"), None);
+    assert_eq!(audio::format_time(90.5), "01:30.500");
+    assert_eq!(audio::format_time(3690.0), "1:01:30.000");
+    assert_eq!(parse_time(&audio::format_time(1234.567)), Some(1234.567));
+}
+
+#[test]
+fn pan_law() {
+    let (l, r) = mix::pan_gains(0.0);
+    assert!((l - r).abs() < 1e-6);
+    assert!((l * l + r * r - 1.0).abs() < 1e-5, "constant power");
+    let (l, r) = mix::pan_gains(-1.0);
+    assert!((l - 1.0).abs() < 1e-6 && r.abs() < 1e-6);
+    let (l, r) = mix::pan_gains(1.0);
+    assert!(l.abs() < 1e-6 && (r - 1.0).abs() < 1e-6);
+}
