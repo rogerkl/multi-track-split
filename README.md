@@ -22,6 +22,16 @@ Multitrack exports keep the recording's sample rate and bit depth (16–24 bit).
 
 Space play/pause · ←/→ step · N new song · I/O song start/end at playhead · +/- zoom · Shift +/- amplitude zoom · wheel zoom · Shift+wheel pan. Shortcuts are inactive while a text field is focused.
 
+## Releases
+
+Pushing a tag like `v1.0.0` runs the GitHub Actions workflow in `.github/workflows/release.yml`, which builds a Linux tarball, a Windows zip and a universal macOS `.app` bundle (ad-hoc signed) and attaches them to a GitHub release. The icons in `assets/icon/` are rendered from `multi-track-split.svg` with ImageMagick:
+
+```sh
+magick -background none -density 384 assets/icon/multi-track-split.svg -resize 1024x1024 -depth 8 /tmp/base.png
+for s in 16 32 48 64 128 256 512 1024; do magick /tmp/base.png -resize ${s}x${s} PNG32:assets/icon/multi-track-split-$s.png; done
+magick assets/icon/multi-track-split-{16,32,48,64,128,256}.png assets/icon/multi-track-split.ico
+```
+
 ## Building
 
 ```sh

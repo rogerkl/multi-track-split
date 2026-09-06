@@ -1,0 +1,169 @@
+name: Build Multi-Platform Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers when you push a version tag like v1.0.0
+
+permissions:
+  contents: write # Needed to create the release and upload assets
+
+jobs:
+  # ----------------------------------------------------
+  # MACOS BUILD JOB (Generates Universal .app bundle)
+  # ----------------------------------------------------
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Build for Intel (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build for Apple Silicon (aarch64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Generate macOS .icns from PNGs
+        run: |
+          # Apple iconsets only accept these exact names; the 64 and 1024 px
+          # sizes go in as the @2x variants of 32 and 512.
+          mkdir -p MultiTrackSplit.iconset
+          cp assets/icon/multi-track-split-16.png   MultiTrackSplit.iconset/icon_16x16.png
+          cp assets/icon/multi-track-split-32.png   MultiTrackSplit.iconset/icon_16x16@2x.png
+          cp assets/icon/multi-track-split-32.png   MultiTrackSplit.iconset/icon_32x32.png
+          cp assets/icon/multi-track-split-64.png   MultiTrackSplit.iconset/icon_32x32@2x.png
+          cp assets/icon/multi-track-split-128.png  MultiTrackSplit.iconset/icon_128x128.png
+          cp assets/icon/multi-track-split-256.png  MultiTrackSplit.iconset/icon_128x128@2x.png
+          cp assets/icon/multi-track-split-256.png  MultiTrackSplit.iconset/icon_256x256.png
+          cp assets/icon/multi-track-split-512.png  MultiTrackSplit.iconset/icon_256x256@2x.png
+          cp assets/icon/multi-track-split-512.png  MultiTrackSplit.iconset/icon_512x512.png
+          cp assets/icon/multi-track-split-1024.png MultiTrackSplit.iconset/icon_512x512@2x.png
+
+          # Convert iconset folder to a single .icns file
+          iconutil -c icns MultiTrackSplit.iconset -o AppIcon.icns
+
+      - name: Create macOS App Bundle Structure
+        run: |
+          # Version comes from the pushed tag (v1.2.3 -> 1.2.3)
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          mkdir -p "MultiTrackSplit.app/Contents/MacOS"
+          mkdir -p "MultiTrackSplit.app/Contents/Resources"
+
+          # Move the newly generated icon into Resources
+          cp AppIcon.icns "MultiTrackSplit.app/Contents/Resources/AppIcon.icns"
+
+          # Create Info.plist mapping the executable and the icon
+          cat <<EOF > MultiTrackSplit.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>MultiTrackSplit</string>
+              <key>CFBundleIdentifier</key>
+              <string>info.klaveness.MultiTrackSplit</string>
+              <key>CFBundleName</key>
+              <string>MultiTrackSplit</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon.icns</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Combine into Universal Binary
+        run: |
+          lipo -create \
+            target/x86_64-apple-darwin/release/multi-track-split \
+            target/aarch64-apple-darwin/release/multi-track-split \
+            -output MultiTrackSplit.app/Contents/MacOS/MultiTrackSplit
+
+      - name: Ad-Hoc Sign the App Bundle
+        run: codesign --force --deep --sign - MultiTrackSplit.app
+
+      - name: Compress App Bundle into a Zip
+        run: zip -r MultiTrackSplit-macOS-Universal.zip MultiTrackSplit.app
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: MultiTrackSplit-macOS-Universal.zip
+
+  # ----------------------------------------------------
+  # WINDOWS BUILD JOB
+  # ----------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Build Binary
+        run: cargo build --release
+
+      - name: Zip Windows Artifact
+        run: Compress-Archive -Path target/release/multi-track-split.exe -DestinationPath MultiTrackSplit-Windows.zip
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: MultiTrackSplit-Windows.zip
+
+  # ----------------------------------------------------
+  # LINUX BUILD JOB
+  # ----------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install GUI Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Build Binary
+        run: cargo build --release
+
+      - name: Tar Linux Artifact
+        run: tar -czvf MultiTrackSplit-Linux-x86_64.tar.gz -C target/release multi-track-split
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: MultiTrackSplit-Linux-x86_64.tar.gz
+
+  # ----------------------------------------------------
+  # RELEASE JOB (runs once, after all builds succeed)
+  # ----------------------------------------------------
+  release:
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

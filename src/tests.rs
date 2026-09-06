@@ -341,3 +341,8 @@ fn pan_law() {
     let (l, r) = mix::pan_gains(1.0);
     assert!(l.abs() < 1e-6 && (r - 1.0).abs() < 1e-6);
 }
+
+#[test]
+fn window_icon_decodes() {
+    assert!(crate::window_icon().is_some(), "embedded 64 px PNG must be 8-bit RGBA");
+}

@@ -33,7 +33,11 @@ fn main() -> iced::Result {
     iced::application("Multi Track Split — tape song organizer", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| Theme::Dark)
-        .window_size((1560.0, 960.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(1560.0, 960.0),
+            icon: window_icon(),
+            ..Default::default()
+        })
         .antialiasing(true)
         .run_with(move || {
             let task = if initial.is_empty() {
@@ -43,6 +47,22 @@ fn main() -> iced::Result {
             };
             (App::default(), task)
         })
+}
+
+/// The window/taskbar icon, decoded from the PNG baked into the binary. The
+/// Windows .exe icon comes from build.rs instead; this one is what Linux
+/// desktops and the running window show.
+fn window_icon() -> Option<iced::window::Icon> {
+    let bytes: &[u8] = include_bytes!("../assets/icon/multi-track-split-64.png");
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    buf.truncate(info.buffer_size());
+    iced::window::icon::from_rgba(buf, info.width, info.height).ok()
 }
 
 /// A time text field being edited. Edits are kept as a draft string until

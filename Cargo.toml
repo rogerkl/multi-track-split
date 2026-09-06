@@ -5,14 +5,24 @@ edition = "2024"
 description = "Define, mix and export songs from multitrack tape transfers"
 authors = ["Roger Klaveness"]
 
+# Extra fields embedded in the Windows .exe version info (see build.rs)
+[package.metadata.winresource]
+ProductName = "Multi Track Split"
+FileDescription = "Define, mix and export songs from multitrack tape transfers"
+LegalCopyright = "Copyright © 2026 Roger Klaveness"
+
 [dependencies]
 flacenc = { version = "0.5", default-features = false }
 iced = { version = "0.13", features = ["canvas", "tokio"] }
+png = "0.17"
 rfd = "0.15"
 rodio = { version = "0.19", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.5", default-features = false, features = ["flac", "wav", "pcm"] }
+
+[build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

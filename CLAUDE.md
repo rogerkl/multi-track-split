@@ -38,4 +38,6 @@ Positions are **absolute sample frames** (`usize`) everywhere, including per-tra
 
 Keyboard shortcuts come from `iced::event::listen_with` and only fire when the event status is `Ignored`, i.e. no text input is focused. Time text fields are edited as a draft (`App::draft`) and committed on Enter via `TimeCommit`.
 
+Icons: `assets/icon/multi-track-split.svg` is the source; the PNG sizes and the `.ico` are rendered from it with ImageMagick (commands in README). `build.rs` embeds the `.ico` and version info into the Windows exe via winresource; `window_icon()` in `main.rs` decodes the 64 px PNG (png crate) for the runtime window icon. `.github/workflows/release.yml` builds Linux/Windows/macOS artifacts on `v*` tags and publishes a GitHub release.
+
 Long-running work (loading, export) runs through `Task::perform`; heavy data crosses task boundaries as `Arc<AudioData>`.
