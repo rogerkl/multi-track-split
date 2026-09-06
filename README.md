@@ -36,3 +36,5 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 The whole recording is decoded into memory as 32-bit float: an 8-track, 24-bit, 48 kHz, 45-minute tape takes about 4 GB of RAM.
+
+![Screenshot](Screenshot.png)
