@@ -55,6 +55,21 @@ impl StemFormat {
     pub fn extension(self) -> &'static str {
         self.format.extension()
     }
+
+    /// Interleaved FLAC cannot hold a recording with more tracks than FLAC
+    /// allows, so that choice is offered only for recordings that fit.
+    pub fn available_for(channels: usize) -> Vec<StemFormat> {
+        Self::ALL
+            .into_iter()
+            .filter(|f| f.is_available_for(channels))
+            .collect()
+    }
+
+    pub fn is_available_for(self, channels: usize) -> bool {
+        !(self.format == Format::Flac
+            && self.layout == StemLayout::Interleaved
+            && channels > FLAC_MAX_CHANNELS)
+    }
 }
 
 impl Default for StemFormat {
@@ -73,9 +88,6 @@ impl std::fmt::Display for StemFormat {
             Format::Flac => "FLAC",
         };
         match self.layout {
-            StemLayout::Interleaved if self.format == Format::Flac => {
-                write!(f, "{name} interleaved (≤ {FLAC_MAX_CHANNELS} tracks)")
-            }
             StemLayout::Interleaved => write!(f, "{name} interleaved"),
             StemLayout::Tracks => write!(f, "{name} one file per track"),
         }

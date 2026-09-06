@@ -230,6 +230,17 @@ impl App {
         self.audio.as_ref().map_or(0, |a| a.frames())
     }
 
+    /// Keeps the stem format to what the loaded recording can be written as.
+    fn fit_stem_format(&mut self) {
+        let channels = self.audio.as_ref().map_or(0, |a| a.channels());
+        if !self.stem_format.is_available_for(channels) {
+            self.stem_format = export::StemFormat {
+                format: export::Format::Wav,
+                layout: export::StemLayout::Interleaved,
+            };
+        }
+    }
+
     fn min_range(&self) -> usize {
         (MIN_RANGE_SECS * self.sample_rate()) as usize
     }
@@ -662,6 +673,7 @@ impl App {
                     Some(p) => {
                         let mismatch = p.channels != channels;
                         self.apply_project(p);
+                        self.fit_stem_format();
                         self.status = format!(
                             "{info} — {} songs from {}{}",
                             self.songs.len(),
@@ -684,6 +696,7 @@ impl App {
                             .unwrap_or_default();
                         self.songs.clear();
                         self.next_id = 0;
+                        self.fit_stem_format();
                         self.dirty = false;
                         self.status = format!("{info}. Press N to add a song at the playhead.");
                     }
@@ -1177,7 +1190,9 @@ impl App {
         let export_bar = row![
             text("Stems as").size(13),
             pick_list(
-                export::StemFormat::ALL,
+                export::StemFormat::available_for(
+                    self.audio.as_ref().map_or(0, |a| a.channels())
+                ),
                 Some(self.stem_format),
                 Message::StemFormatSelected,
             )

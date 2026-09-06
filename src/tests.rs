@@ -208,6 +208,11 @@ fn end_to_end() {
     export::export_all_multitrack(&audio, &both, &names, &all_dir, interleaved).unwrap();
     assert!(all_dir.join("01 - Overlap.flac").is_file());
     assert!(all_dir.join("02 - Second_ Take_2.flac").is_file());
+    assert_eq!(export::StemFormat::available_for(8).len(), 4);
+    let nine = export::StemFormat::available_for(9);
+    assert_eq!(nine.len(), 3);
+    assert!(!nine.contains(&interleaved), "interleaved FLAC is out for 9-track tapes");
+    assert!(nine.contains(&StemFormat { format: Format::Flac, layout: StemLayout::Tracks }));
     let per_track = StemFormat { format: Format::Flac, layout: StemLayout::Tracks };
     export::export_all_multitrack(&audio, &both, &names, &all_dir, per_track).unwrap();
     assert!(all_dir.join("01 - Overlap").join("T01 - Kick.flac").is_file());
