@@ -113,6 +113,8 @@ pub enum Message {
     ExportMixPathChosen(Option<PathBuf>),
     ExportMulti,
     ExportMultiPathChosen(Option<PathBuf>),
+    /// Per-track stem layout: the parent folder the song folder goes into.
+    ExportStemsDirChosen(Option<PathBuf>),
     ExportAll,
     ExportAllDirChosen(Option<PathBuf>),
     ExportAllMixes,
@@ -121,6 +123,7 @@ pub enum Message {
 
     DeviceSelected(String),
     MixFormatSelected(export::MixFormat),
+    StemFormatSelected(export::StemFormat),
 }
 
 const DEFAULT_DEVICE: &str = "System default";
@@ -162,6 +165,8 @@ struct App {
     selected_device: String,
     /// How mixdowns are written (float, or normalized integer).
     mix_format: export::MixFormat,
+    /// How multitrack stems are written (interleaved, or one file per track).
+    stem_format: export::StemFormat,
 
     status: String,
 }
@@ -197,6 +202,7 @@ impl Default for App {
             },
             selected_device: DEFAULT_DEVICE.to_string(),
             mix_format: export::MixFormat::default(),
+            stem_format: export::StemFormat::default(),
             status: "Open a multitrack WAV/FLAC, several mono/stereo files, or a saved project to get started."
                 .to_string(),
         }
@@ -464,6 +470,7 @@ impl App {
             track_names: self.track_names.clone(),
             songs: self.songs.clone(),
             mix_format: Some(self.mix_format),
+            stem_format: Some(self.stem_format),
         })
     }
 
@@ -495,6 +502,9 @@ impl App {
         self.track_names = names;
         if let Some(mode) = project.mix_format {
             self.mix_format = mode;
+        }
+        if let Some(mode) = project.stem_format {
+            self.stem_format = mode;
         }
         self.songs = project.songs;
         for (i, song) in self.songs.iter_mut().enumerate() {
@@ -910,17 +920,34 @@ impl App {
                 }
                 let is_mix = matches!(message, Message::ExportMix);
                 let stem = export::song_file_stem(self.song_number(song.id), song);
-                let name = if is_mix {
-                    format!("{stem} (mix).{}", self.mix_format.extension())
-                } else if song.active_channels().len() > export::FLAC_MAX_CHANNELS {
-                    format!("{stem}.wav")
-                } else {
-                    format!("{stem}.flac")
-                };
                 let dir = self
                     .audio
                     .as_ref()
                     .and_then(|a| a.path.parent().map(|p| p.to_path_buf()));
+                if !is_mix && self.stem_format.layout == export::StemLayout::Tracks {
+                    // One file per track: ask for the folder to put the
+                    // song's folder into.
+                    return Task::perform(
+                        async move {
+                            let mut dialog = rfd::AsyncFileDialog::new();
+                            if let Some(dir) = dir {
+                                dialog = dialog.set_directory(dir);
+                            }
+                            dialog.pick_folder().await.map(|h| h.path().to_path_buf())
+                        },
+                        Message::ExportStemsDirChosen,
+                    );
+                }
+                let name = if is_mix {
+                    format!("{stem} (mix).{}", self.mix_format.extension())
+                } else if self.stem_format.format == export::Format::Flac
+                    && song.active_channels().len() > export::FLAC_MAX_CHANNELS
+                {
+                    format!("{stem}.wav")
+                } else {
+                    format!("{stem}.{}", self.stem_format.extension())
+                };
+                let stems_wav = self.stem_format.format == export::Format::Wav;
                 let mix_format = self.mix_format;
                 let dialog = async move {
                     let mut dialog = rfd::AsyncFileDialog::new();
@@ -929,6 +956,9 @@ impl App {
                             dialog.add_filter("WAV (32-bit float)", &["wav"])
                         }
                         (true, _) if mix_format.extension() == "wav" => {
+                            dialog.add_filter("WAV", &["wav"]).add_filter("FLAC", &["flac"])
+                        }
+                        (false, _) if stems_wav => {
                             dialog.add_filter("WAV", &["wav"]).add_filter("FLAC", &["flac"])
                         }
                         _ => dialog.add_filter("FLAC", &["flac"]).add_filter("WAV", &["wav"]),
@@ -972,6 +1002,22 @@ impl App {
                 );
             }
             Message::ExportMixPathChosen(None) | Message::ExportMultiPathChosen(None) => {}
+            Message::ExportStemsDirChosen(Some(parent)) => {
+                let (Some(audio), Some(song)) = (self.audio.clone(), self.selected_song().cloned())
+                else {
+                    return Task::none();
+                };
+                let dir = parent.join(export::song_file_stem(self.song_number(song.id), &song));
+                let names = self.track_names.clone();
+                let format = self.stem_format.format;
+                self.exporting = true;
+                self.status = format!("Exporting track files to {}…", dir.display());
+                return Task::perform(
+                    async move { export::export_stem_tracks(&audio, &song, &names, &dir, format) },
+                    Message::ExportDone,
+                );
+            }
+            Message::ExportStemsDirChosen(None) => {}
             Message::ExportAll | Message::ExportAllMixes => {
                 if self.audio.is_none() || self.songs.is_empty() || self.exporting {
                     return Task::none();
@@ -998,12 +1044,12 @@ impl App {
                     return Task::none();
                 };
                 let songs = self.songs.clone();
+                let names = self.track_names.clone();
+                let stems = self.stem_format;
                 self.exporting = true;
-                self.status = format!("Exporting {} songs as multitrack FLAC…", songs.len());
+                self.status = format!("Exporting {} songs ({stems})…", songs.len());
                 return Task::perform(
-                    async move {
-                        export::export_all_multitrack(&audio, &songs, &dir, export::Format::Flac)
-                    },
+                    async move { export::export_all_multitrack(&audio, &songs, &names, &dir, stems) },
                     Message::ExportDone,
                 );
             }
@@ -1032,6 +1078,10 @@ impl App {
 
             Message::MixFormatSelected(mode) => {
                 self.mix_format = mode;
+                self.dirty = true;
+            }
+            Message::StemFormatSelected(mode) => {
+                self.stem_format = mode;
                 self.dirty = true;
             }
             Message::DeviceSelected(name) => {
@@ -1118,6 +1168,23 @@ impl App {
                 .on_press_maybe(selected.map(|_| Message::SongStartToPlayhead)),
             button(text("End = playhead (O)"))
                 .on_press_maybe(selected.map(|_| Message::SongEndToPlayhead)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let can_export = selected.is_some() && !self.exporting;
+        let can_export_all = has_audio && !self.songs.is_empty() && !self.exporting;
+        let export_bar = row![
+            text("Stems as").size(13),
+            pick_list(
+                export::StemFormat::ALL,
+                Some(self.stem_format),
+                Message::StemFormatSelected,
+            )
+            .text_size(13),
+            button(text("Export multitrack…")).on_press_maybe(can_export.then_some(Message::ExportMulti)),
+            button(text("Export all multitrack…"))
+                .on_press_maybe(can_export_all.then_some(Message::ExportAll)),
             horizontal_space(),
             text("Mix as").size(13),
             pick_list(
@@ -1126,17 +1193,9 @@ impl App {
                 Message::MixFormatSelected,
             )
             .text_size(13),
-            button(text("Export mix…"))
-                .on_press_maybe((selected.is_some() && !self.exporting).then_some(Message::ExportMix)),
-            button(text("Export multitrack…"))
-                .on_press_maybe((selected.is_some() && !self.exporting).then_some(Message::ExportMulti)),
-            button(text("Export all multitrack…")).on_press_maybe(
-                (has_audio && !self.songs.is_empty() && !self.exporting).then_some(Message::ExportAll)
-            ),
-            button(text("Export all mixes…")).on_press_maybe(
-                (has_audio && !self.songs.is_empty() && !self.exporting)
-                    .then_some(Message::ExportAllMixes)
-            ),
+            button(text("Export mix…")).on_press_maybe(can_export.then_some(Message::ExportMix)),
+            button(text("Export all mixes…"))
+                .on_press_maybe(can_export_all.then_some(Message::ExportAllMixes)),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
@@ -1240,6 +1299,7 @@ impl App {
 
         column![
             toolbar,
+            export_bar,
             zoom_bar,
             waveform_view,
             scroll_bar,

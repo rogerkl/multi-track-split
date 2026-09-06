@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::audio::{self, parse_time};
-use crate::export::{self, Format, MixFormat};
+use crate::export::{self, Format, MixFormat, StemFormat, StemLayout};
 use crate::mix;
 use crate::project::{self, Project, Song};
 
@@ -178,16 +178,41 @@ fn end_to_end() {
     assert!(err.contains("8 channels"), "{err}");
     assert_eq!(wide.active_channels().len(), 9);
 
-    // Export-all names files by number and title.
+    // Per-track stems: one mono file per used track in a song folder, with
+    // the same silence placement as the interleaved file.
+    let names: Vec<String> = ["Kick", "Bass", "Gtr", "Vox"].map(String::from).to_vec();
+    let loud = 0.5 / 2f32.sqrt();
+    let stem_dir = dir.join("01 - Overlap");
+    let _ = std::fs::remove_dir_all(&stem_dir);
+    let msg = export::export_stem_tracks(&audio, &song, &names, &stem_dir, Format::Wav).unwrap();
+    assert!(msg.contains("3 track files"), "{msg}");
+    assert!(!stem_dir.join("T04 - Vox.wav").exists(), "unused track is not written");
+    let bass = audio::load(&stem_dir.join("T02 - Bass.wav")).unwrap();
+    assert_eq!(bass.channels(), 1);
+    assert_eq!(bass.frames(), secs(20.0));
+    assert!(rms(&bass.tracks[0][..secs(10.0)]) < 0.001);
+    assert!((rms(&bass.tracks[0][secs(10.0)..]) - loud).abs() < 0.02);
+    let gtr = audio::load(&stem_dir.join("T03 - Gtr.wav")).unwrap();
+    assert!((rms(&gtr.tracks[0][..secs(15.0)]) - loud).abs() < 0.02);
+    assert!(rms(&gtr.tracks[0][secs(15.0)..]) < 0.001);
+    assert_eq!(export::stem_file_name(5, &names, "flac"), "T06 - Track 6.flac");
+
+    // Export-all names files by number and title, in either layout.
     let all_dir = dir.join("all");
     let _ = std::fs::remove_dir_all(&all_dir);
     std::fs::create_dir_all(&all_dir).unwrap();
     let mut second = Song::new(1, "Second: Take/2".into(), secs(20.0), secs(30.0), 4);
     second.tracks[0].active = false;
-    export::export_all_multitrack(&audio, &[song.clone(), second.clone()], &all_dir, Format::Flac)
-        .unwrap();
+    let both = [song.clone(), second.clone()];
+    let interleaved = StemFormat { format: Format::Flac, layout: StemLayout::Interleaved };
+    export::export_all_multitrack(&audio, &both, &names, &all_dir, interleaved).unwrap();
     assert!(all_dir.join("01 - Overlap.flac").is_file());
     assert!(all_dir.join("02 - Second_ Take_2.flac").is_file());
+    let per_track = StemFormat { format: Format::Flac, layout: StemLayout::Tracks };
+    export::export_all_multitrack(&audio, &both, &names, &all_dir, per_track).unwrap();
+    assert!(all_dir.join("01 - Overlap").join("T01 - Kick.flac").is_file());
+    assert!(all_dir.join("02 - Second_ Take_2").join("T02 - Bass.flac").is_file());
+    assert!(!all_dir.join("02 - Second_ Take_2").join("T01 - Kick.flac").exists());
 
     // Project round trip through JSON, referenced by bare file name.
     let project_path = project::sidecar_path(std::slice::from_ref(&tape_path));
@@ -199,6 +224,7 @@ fn end_to_end() {
         track_names: vec!["Kick".into(), "Bass".into(), "Gtr".into(), "Vox".into()],
         songs: vec![song.clone(), second],
         mix_format: Some(MixFormat::Normalized { format: Format::Flac, bits: 24 }),
+        stem_format: Some(StemFormat { format: Format::Wav, layout: StemLayout::Tracks }),
     };
     assert_eq!(project.audio_files, ["tape.wav"]);
     project::save(&project_path, &project).unwrap();
@@ -209,6 +235,7 @@ fn end_to_end() {
     assert_eq!(loaded.songs[1].id, 1, "ids are reassigned on load");
     assert_eq!(loaded.track_names[2], "Gtr");
     assert_eq!(loaded.mix_format, project.mix_format);
+    assert_eq!(loaded.stem_format, project.stem_format);
     assert_eq!(
         project::resolve_audio_path(&project_path, &loaded.files()[0]).as_deref(),
         Some(tape_path.as_path())

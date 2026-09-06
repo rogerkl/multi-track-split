@@ -18,6 +18,70 @@ use crate::audio::AudioData;
 use crate::mix;
 use crate::project::Song;
 
+/// Whether a song's stems go into one interleaved file or one file per track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StemLayout {
+    Interleaved,
+    Tracks,
+}
+
+/// How multitrack stems are written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StemFormat {
+    pub format: Format,
+    pub layout: StemLayout,
+}
+
+impl StemFormat {
+    pub const ALL: [StemFormat; 4] = [
+        StemFormat {
+            format: Format::Wav,
+            layout: StemLayout::Interleaved,
+        },
+        StemFormat {
+            format: Format::Wav,
+            layout: StemLayout::Tracks,
+        },
+        StemFormat {
+            format: Format::Flac,
+            layout: StemLayout::Interleaved,
+        },
+        StemFormat {
+            format: Format::Flac,
+            layout: StemLayout::Tracks,
+        },
+    ];
+
+    pub fn extension(self) -> &'static str {
+        self.format.extension()
+    }
+}
+
+impl Default for StemFormat {
+    fn default() -> Self {
+        StemFormat {
+            format: Format::Flac,
+            layout: StemLayout::Interleaved,
+        }
+    }
+}
+
+impl std::fmt::Display for StemFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.format {
+            Format::Wav => "WAV",
+            Format::Flac => "FLAC",
+        };
+        match self.layout {
+            StemLayout::Interleaved if self.format == Format::Flac => {
+                write!(f, "{name} interleaved (≤ {FLAC_MAX_CHANNELS} tracks)")
+            }
+            StemLayout::Interleaved => write!(f, "{name} interleaved"),
+            StemLayout::Tracks => write!(f, "{name} one file per track"),
+        }
+    }
+}
+
 /// Peak level normalized mixes are scaled to, leaving a little headroom
 /// for inter-sample peaks and lossy transcodes.
 pub const NORMALIZE_TARGET_DB: f32 = -1.0;
@@ -170,6 +234,21 @@ pub fn render_multitrack(audio: &AudioData, song: &Song) -> Result<(Vec<f32>, us
     Ok((out, n))
 }
 
+/// One track of the song as a mono stem: zero outside the track's effective
+/// range, `None` when the song does not use the track.
+pub fn render_track_stem(audio: &AudioData, song: &Song, ch: usize) -> Option<Vec<f32>> {
+    let end = song.end.min(audio.frames());
+    if end <= song.start || ch >= audio.channels() || !song.tracks.get(ch)?.active {
+        return None;
+    }
+    let mut out = vec![0.0f32; end - song.start];
+    if let Some((s, e)) = song.track_range(ch) {
+        let e = e.min(end);
+        out[s - song.start..e - song.start].copy_from_slice(&audio.tracks[ch][s..e]);
+    }
+    Some(out)
+}
+
 /// Interleaved stereo mixdown of the song plus its peak level. The samples
 /// are not clamped; integer writers clamp when quantizing.
 pub fn render_mixdown(audio: &AudioData, song: &Song) -> Result<(Vec<f32>, f32), String> {
@@ -294,27 +373,75 @@ pub fn export_all_mixdowns(
     Ok(format!("Exported {written} mixes ({mode}) to {}.", dir.display()))
 }
 
-/// Exports every song as a multitrack file into `dir`, named `NN - Title`.
-/// Songs with more active tracks than FLAC allows fall back to WAV.
-pub fn export_all_multitrack(
+/// File name of one stem inside a song's folder: `T03 - Bass.flac`.
+pub fn stem_file_name(ch: usize, track_names: &[String], ext: &str) -> String {
+    let name = track_names
+        .get(ch)
+        .map(|n| sanitize_filename(n))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("Track {}", ch + 1));
+    format!("T{:02} - {name}.{ext}", ch + 1)
+}
+
+/// Writes the song's used tracks as mono files into `dir` (created if
+/// needed), each silent outside the track's own range.
+pub fn export_stem_tracks(
     audio: &AudioData,
-    songs: &[Song],
+    song: &Song,
+    track_names: &[String],
     dir: &Path,
     format: Format,
 ) -> Result<String, String> {
+    let channels = song.active_channels();
+    if channels.is_empty() {
+        return Err("The song has no active tracks".to_string());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let mut written = 0;
-    for (i, song) in songs.iter().enumerate() {
-        let format = if format == Format::Flac && song.active_channels().len() > FLAC_MAX_CHANNELS
-        {
-            Format::Wav
-        } else {
-            format
+    for ch in channels {
+        let Some(samples) = render_track_stem(audio, song, ch) else {
+            continue;
         };
-        let path = dir.join(format!("{}.{}", song_file_stem(i + 1, song), format.extension()));
-        export_multitrack(audio, song, &path).map_err(|e| format!("Song {}: {e}", i + 1))?;
+        let path = dir.join(stem_file_name(ch, track_names, format.extension()));
+        write_audio(&path, &samples, 1, audio.bits_per_sample, audio.sample_rate)?;
         written += 1;
     }
-    Ok(format!("Exported {written} multitrack files to {}.", dir.display()))
+    Ok(format!("Wrote {written} track files to {}.", dir.display()))
+}
+
+/// Exports every song into `dir`: an interleaved `NN - Title.<ext>` per
+/// song, or a `NN - Title/` folder of per-track files. Interleaved FLAC
+/// falls back to WAV for songs with more tracks than FLAC allows.
+pub fn export_all_multitrack(
+    audio: &AudioData,
+    songs: &[Song],
+    track_names: &[String],
+    dir: &Path,
+    stems: StemFormat,
+) -> Result<String, String> {
+    let mut written = 0;
+    for (i, song) in songs.iter().enumerate() {
+        let stem = song_file_stem(i + 1, song);
+        match stems.layout {
+            StemLayout::Interleaved => {
+                let format = if stems.format == Format::Flac
+                    && song.active_channels().len() > FLAC_MAX_CHANNELS
+                {
+                    Format::Wav
+                } else {
+                    stems.format
+                };
+                let path = dir.join(format!("{stem}.{}", format.extension()));
+                export_multitrack(audio, song, &path).map_err(|e| format!("Song {}: {e}", i + 1))?;
+            }
+            StemLayout::Tracks => {
+                export_stem_tracks(audio, song, track_names, &dir.join(stem), stems.format)
+                    .map_err(|e| format!("Song {}: {e}", i + 1))?;
+            }
+        }
+        written += 1;
+    }
+    Ok(format!("Exported {written} songs ({stems}) to {}.", dir.display()))
 }
 
 fn encode_flac(

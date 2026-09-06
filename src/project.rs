@@ -113,6 +113,9 @@ pub struct Project {
     /// How "Export mix" writes files; absent in older projects.
     #[serde(default)]
     pub mix_format: Option<crate::export::MixFormat>,
+    /// How "Export multitrack" writes stems; absent in older projects.
+    #[serde(default)]
+    pub stem_format: Option<crate::export::StemFormat>,
 }
 
 impl Project {
