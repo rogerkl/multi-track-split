@@ -1,6 +1,6 @@
 # Multi Track Split
 
-A small desktop tool for organizing backups of multitrack tape recordings (4-, 8- or more-track interleaved WAV/FLAC) into songs, auditioning them with a simple mix, and exporting each song for remixing.
+A small desktop tool for organizing backups of multitrack tape recordings (4-, 8- or more-track interleaved WAV/FLAC) into songs, auditioning them with a simple mix, and exporting raw mixes (volume and pan) or the multitrack stems for each song.
 
 Tape was expensive, so songs often overlap: the end of one song may only use tracks 1–4 while the next one already starts on tracks 5–8. A plain start/end split cannot express that. Here a **song** is a time range on the tape plus, for each tape track:
 
